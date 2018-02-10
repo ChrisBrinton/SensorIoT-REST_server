@@ -1,3 +1,14 @@
+.bash_history/
+.bash_logout/
+.ssh/
+.dbshell
+.python_history
+.sudo_as_admin_successful
+.lesshst
+.profile
+.viminfo
+.virtualenvs
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
