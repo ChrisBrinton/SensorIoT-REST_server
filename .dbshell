@@ -1,0 +1,99 @@
+db.Sensors.remove({})
+db.Sensors.find()
+db.Sensors.count()
+db.Sensors.find()
+show dbs
+use gdsavedb_prod
+db.Sensors.find()
+db.Sensors.count()
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+exit()
+ls
+show dbs
+show dbs
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({'node_id':50})
+db.Sensors.find({'node_id':'50'})
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({'node_id': '50', '$and': [{'time': {'$gte': 1508803200.0}}, {'time': {'$lte': 1508889600.0}}], 'type': 'F'})
+db.Sensors.find({'node_id': '50', 'type': 'F'})
+db.Sensors.find({'node_id': '50', 'time': {'$gte': 1508803200.0}, 'type': 'F'})
+db.Sensors.find({'node_id': '50', 'time': {'$gte': 1507803200.0}, 'type': 'F'})
+db.Sensors.find({'node_id': '50', 'time': {'$gte': 1508800200.0}, 'type': 'F'})
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find().sort({_id:-1})
+db.Sensors.find().distinct('node_id')
+db.Sensors.distinct('node_id')
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({type: F})
+db.Sensors.find({type: 'F'})
+db.Sensors.find({type: 'F'}).sort({time: -1})
+exit()
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({node_id:54})
+db.Sensors.find({node_id:51})
+db.Sensors.find({node_id:42})
+db.Sensors.find({node_id: 42})
+db.Sensors.find()
+db.Sensors.find({"node_id": "42"})
+db.Sensors.find({"node_id": "54"})
+db.Sensors.find({"node_id": "54"}).sort("time":-1)
+db.Sensors.find({"node_id": "54"}).sort({"time":-1})
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({type:F})
+db.Sensors.find({'type':'F'})
+db.Sensors.find({'type':'F'}).sort({'time'})
+db.Sensors.find({'type':'F'}).sort({'time':1})
+use gdtechdb_prod
+db.Sensors.find()
+use gdtechdb_prod
+db.Sensors.find({'type':'F'})
+c = db.Sensors.find({'type':'F'})
+c.sort({'time':1})
+use gdtechdb_prod
+db.Sensor.find()
+use gdtechdb_prod
+db.Sensor.find()
+db.Sensors.find()
+show dbs
+use gdtechdb_prod
+db.Sensors.fing()
+db.Sensors.find()
+db.Sensors.find({node_id:54})
+db.Sensors.find({node_id:'54'})
+db.Sensors.find({node_id:'54'}).sort({time:-1})
+show dbs
+use gdtechdb_prod
+db.Sensors.find()
+db.Sensors.find({node_id:'54'})
+db.Sensors.find({node_id:'54'}).limit(100)
+db.Sensors.find({node_id:'54'}).limit(100).sort({time:-1})
+use gdtechdb_prod
+ls
+db.Sensors.find()
+db.Sensors.find().sort({'time':-1})
+db.Sensors.find({'node_id':50}).sort({'time':-1})
+db.Sensors.find({'node_id':'50'}).sort({'time':-1})
