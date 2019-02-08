@@ -9,10 +9,11 @@ from dateutil.tz import *
 
 print('connecting to mongo...')
 client = MongoClient('localhost', 27017)  # make this explicit
-db = client['gdtechdb_prod']
+db = client['gdtechdb_test']
 #db = client.test
 sensors = db['Sensors']
 sensorsLatest = db['SensorsLatest']
+nicknames = db['Nicknames']
 app = Flask(__name__)
 CORS(app)
 timefmt = '%Y-%m-%d %H:%M:%S'
@@ -128,6 +129,66 @@ def getlatest(gw, start):
 
     print(json.dumps(docs))
     return docs
+
+@app.route("/save_nicknames", methods=['POST'])
+def save_nicknames():
+    print('save_nicknames called')
+    req_data = request.get_json()
+    config_list = req_data['gatewayConfig']
+    for config in config_list:
+        gw = config['gatewayID']
+        nicknamelist = config['nodeNicknames']
+#        print('req_data ', req_data, ' nicknamelist ', nicknamelist)
+        for item in nicknamelist:
+            node_id = item['nodeID']
+            shortname = item['shortname']
+            longname = item['longname']
+            print('nickname list element ', gw, node_id, shortname, longname)
+            db.Nicknames.update_one(
+               { 'gateway_id': gw, 'node_id': node_id },
+               { '$set': {
+                     'gateway_id': gw,
+                     'node_id': node_id,
+                     'shortname': shortname,
+                     'longname': longname,
+                     },
+                 '$inc': {'seq_no': 1},
+               },
+               True)
+
+    return 'OK'
+
+@app.route("/get_nicknames", methods=['GET'])
+def get_nicknames():
+    print('get_nicknames called')
+    gateways = request.args.getlist('gw')
+    print('for gw list ', gateways)
+    returndoc = []
+    for gateway in gateways:
+        record = {'gateway_id': 0, 'nicknames': []}
+
+        resultsarray = []
+        filt = {'gateway_id': gateway}
+        proj = {'_id': 0}
+        sortparam = [('node_id', 1)]
+        print('get_nicknames query is filter %s projection %s and sort is ' % (filt, proj), sortparam)
+        cursor = nicknames.find(filt, proj).sort(sortparam)
+        for row in cursor:
+            newrow = {}
+            print('query returned ', row)
+            newrow['node_id'] = row['node_id']
+            newrow['shortname'] = row['shortname']
+            newrow['longname'] = row['longname']
+            newrow['seq_no'] = row['seq_no']
+
+            resultsarray.append(newrow)
+
+        record['gateway_id'] = gateway
+        record['nicknames'] = resultsarray
+        returndoc.append(record)
+
+    print('get_nicknames returning ', json.dumps(returndoc))
+    return json.dumps(returndoc)
 
 @app.route("/gw/<gw>", methods=['GET'])
 def gw(gw):
@@ -309,8 +370,9 @@ def testquery4():
 def testquery5():
     nodes = ['70', '72']
     returndocs = []
+    period = 3*30*24 #num of hours of data to retrieve
     starttime = dt.datetime.now(tzutc())
-    returndocs = gwiteratenodes('16E542', nodes, 'F', 24, 'EST5EDT')
+    returndocs = gwiteratenodes('16E542', nodes, 'F', period, 'EST5EDT')
     endtime = dt.datetime.now(tzutc())
     print('executed in ', endtime - starttime)
 

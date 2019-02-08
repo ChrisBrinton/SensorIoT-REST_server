@@ -8,6 +8,8 @@
 .profile
 .viminfo
 .virtualenvs
+nohup.out
+gunicorn.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
