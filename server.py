@@ -9,7 +9,7 @@ from dateutil.tz import *
 
 print('connecting to mongo...')
 client = MongoClient('localhost', 27017)  # make this explicit
-db = client['gdtechdb_test']
+db = client['gdtechdb_prod']
 #db = client.test
 sensors = db['Sensors']
 sensorsLatest = db['SensorsLatest']
@@ -99,6 +99,44 @@ def getnodelist(gw, start):
     print(json.dumps(sorted(values)))
     return values
 
+@app.route("/nodelists", methods=['GET'])
+def get_getnodelists():
+    gateways = request.args.getlist('gw')
+    print('nodelists requested for gw list ', gateways)
+    period = request.args.get('period')
+    try:
+        period = int(period)*24
+    except TypeError as err:
+        period = 24
+    start = getstart(period)
+
+    resultsarray = []
+    for gateway in gateways:
+        nodes = getnodelist(gateway, start)
+        record = {'gateway_id': gateway, 'nodes': nodes}
+        resultsarray.append(record)
+
+    return json.dumps(resultsarray)
+
+@app.route("/latests", methods=['GET'])
+def latests():
+    gateways = request.args.getlist('gw')
+    period = request.args.get('period','')
+    try:
+        period = int(period)
+    except ValueError as err:
+        period = 1
+    start=getstart(period)
+
+    resultsarray = []
+    for gateway in gateways:
+        latest = getlatest(gateway, start)
+        record = {'gateway_id': gateway, 'latest': latest}
+        resultsarray.append(record)
+
+    print(json.dumps(resultsarray))
+    return json.dumps(resultsarray)
+
 @app.route("/latest/<gw>", methods=['GET'])
 def latest(gw):
     period = request.args.get('period','')
@@ -133,13 +171,30 @@ def getlatest(gw, start):
 @app.route("/save_nicknames", methods=['POST'])
 def save_nicknames():
     print('save_nicknames called')
-    req_data = request.get_json()
-    config_list = req_data['gatewayConfig']
-    for config in config_list:
-        gw = config['gatewayID']
-        nicknamelist = config['nodeNicknames']
-#        print('req_data ', req_data, ' nicknamelist ', nicknamelist)
-        for item in nicknamelist:
+    nicknameData = request.get_json()
+    print('nicknameData', nicknameData)
+    for group in nicknameData:
+        gw = group['gateway_id']
+        try:
+            gwLongname = group['longname']
+        except KeyError as err:
+            gwLongname = ''
+        try:
+            gwSeqno = group['seq_no']
+        except KeyError as err:
+            gwSeqno = 0
+        nicknames = group['nicknames']
+        print('gw ', gw, ' gwLongname ', gwLongname)
+        db.GWNicknames.update_one(
+            { 'gateway_id': gw}, 
+            { '$set': {
+                'gateway_id': gw,
+                'longname': gwLongname, 
+                },
+              '$inc': {'seq_no': 1},
+            },
+            True)
+        for item in nicknames:
             node_id = item['nodeID']
             shortname = item['shortname']
             longname = item['longname']
@@ -165,14 +220,14 @@ def get_nicknames():
     print('for gw list ', gateways)
     returndoc = []
     for gateway in gateways:
-        record = {'gateway_id': 0, 'nicknames': []}
+        record = {'gateway_id': 0, 'longname': '', 'seq_no': 0, 'nicknames': []}
 
         resultsarray = []
         filt = {'gateway_id': gateway}
         proj = {'_id': 0}
         sortparam = [('node_id', 1)]
         print('get_nicknames query is filter %s projection %s and sort is ' % (filt, proj), sortparam)
-        cursor = nicknames.find(filt, proj).sort(sortparam)
+        cursor = db.Nicknames.find(filt, proj).sort(sortparam)
         for row in cursor:
             newrow = {}
             print('query returned ', row)
@@ -183,7 +238,16 @@ def get_nicknames():
 
             resultsarray.append(newrow)
 
+        longname = ''
+        seq_no = 0
+        cursor = db.GWNicknames.find(filt)
+        for row in cursor:
+            longname = row['longname']
+            seq_no = row['seq_no']
+            print('longname ', longname, ' seq_no ', seq_no)
         record['gateway_id'] = gateway
+        record['longname'] = longname
+        record['seq_no'] = seq_no
         record['nicknames'] = resultsarray
         returndoc.append(record)
 
@@ -209,7 +273,7 @@ def gwiteratenodes(gw, nodes, type, period, timezone):
     start = getstart(period)
     returndocs = []
     for node in nodes:
-        record = {'nodeID': 0, 'sensorData': []}
+        record = {'gateway_id': gw, 'nodeID': 0, 'sensorData': []}
         record['nodeID'] = node
         print('calling gwdatausinggw with ', gw, node, start, type, timezone, dt.datetime.now())
         record['sensorData'] = getdatausinggw(gw, node, start, type, timezone) 
