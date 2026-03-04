@@ -13,18 +13,19 @@ ENV PATH="/app/venv/bin:$PATH"
 COPY requirements.txt /requirements.txt
 RUN pip install -r /requirements.txt
 
-# Pre-create models directory (mounted as a volume at runtime for persistence)
-RUN mkdir -p /models
+# Pre-create required directories
+RUN mkdir -p /models /public
 
 # Shared anomaly detection module (madi detectors + utils, no TF needed)
 COPY anomalydetection/ /anomalydetection/
 
 # Add server application code
 COPY *.py /
+COPY startup.sh /
 COPY nginx.conf /etc/nginx/
 RUN ln -s /app/venv/bin/certbot /usr/bin/certbot
 COPY options-ssl-nginx.conf /etc/letsencrypt/options-ssl-nginx.conf
-COPY certs/*.pem /etc/letsencrypt/live/brintontech.com/
+# certs/*.pem are NOT baked into the image — mount via volume or Let's Encrypt renewal on the host
 COPY ssl-dhparams.pem /etc/letsencrypt/ssl-dhparams.pem
 #RUN certbot --nginx
 #COPY SensorIoT-REST_server/public/ /

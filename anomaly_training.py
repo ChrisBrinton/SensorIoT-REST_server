@@ -11,12 +11,15 @@ anomaly detection across nodes. Saves the model with joblib and provides predict
 via the unified madi predict() interface.
 """
 
+import datetime
 import json
 import logging
 import os
 import sys
 import time
 from typing import Dict, List, Optional, Tuple
+
+import requests
 
 import joblib
 import numpy as np
@@ -42,6 +45,7 @@ from madi.detectors.one_class_svm import OneClassSVMAd
 from madi.detectors.neg_sample_random_forest import NegativeSamplingRandomForestAd
 import madi.utils.sample_utils as sample_utils
 from madi.utils.evaluation_utils import compute_auc
+from sklearn.metrics import f1_score as sk_f1_score
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -73,6 +77,49 @@ _ANOMALY_THRESHOLD = 0.5
 _BUCKET_SECONDS    = 60   # fallback / minimum bucket size
 # Candidate bucket sizes tried in order (seconds); first one >= max node interval is used.
 _BUCKET_CANDIDATES = (60, 120, 300, 600, 900, 1800, 3600)
+_NOAA_NODE_ID      = 'noaa_forecast'
+_TREND_WINDOW      = 6   # rolling window (buckets) for delta/mean/std trend features
+
+
+def _add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add temporal and rolling trend features to a time-bucketed wide DataFrame.
+
+    Temporal: cyclic sin/cos encoding of hour-of-day and day-of-week so the model
+    learns diurnal and weekly patterns without artificial discontinuities at midnight
+    or the week boundary.
+
+    Trend: per real sensor column (not NOAA, not time meta), three features capture
+    the local trajectory around each reading:
+      {col}_delta      — change from the prior bucket (rate of change)
+      {col}_roll_mean  — rolling mean over the last _TREND_WINDOW buckets
+      {col}_roll_std   — rolling std  over the last _TREND_WINDOW buckets
+    min_periods=1 avoids introducing NaNs at the start of the series.
+    """
+    df = df.sort_values('time_rounded').reset_index(drop=True)
+
+    # Cyclic time features derived from Unix timestamps
+    hours = (df['time_rounded'] % 86400) / 3600              # float 0–24
+    dows  = ((df['time_rounded'] // 86400) % 7).astype(int)  # int 0–6
+    df['hour_sin'] = np.sin(2 * np.pi * hours / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
+    df['dow_sin']  = np.sin(2 * np.pi * dows  / 7)
+    df['dow_cos']  = np.cos(2 * np.pi * dows  / 7)
+
+    # Rolling trend features for real sensor columns only
+    _meta = {'time_rounded', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos'}
+    sensor_cols = [
+        c for c in df.columns
+        if c not in _meta
+        and not c.startswith(_NOAA_NODE_ID)
+        and '_' in c   # node_id_type pattern: "1_F", "2_H", etc.
+    ]
+    for col in sensor_cols:
+        df[f'{col}_delta']     = df[col].diff().fillna(0.0)
+        df[f'{col}_roll_mean'] = df[col].rolling(_TREND_WINDOW, min_periods=1).mean()
+        df[f'{col}_roll_std']  = (df[col].rolling(_TREND_WINDOW, min_periods=1)
+                                         .std(ddof=0).fillna(0.0))
+
+    return df
 
 
 def _optimal_bucket_seconds(df: pd.DataFrame, node_ids: List[str]) -> int:
@@ -122,7 +169,8 @@ def get_gateway_dataframe(db, gateway_id: str,
         cursor = db.Sensors.find(
             {'gateway_id': gateway_id,
              'time': {'$gte': start_ts},
-             'type': {'$in': ['F', 'H', 'P']}},
+             'type': {'$in': ['F', 'H', 'P']},
+             },
             {'_id': 0, 'node_id': 1, 'type': 1, 'value': 1, 'time': 1},
         )
         rows = list(cursor)
@@ -147,8 +195,15 @@ def get_gateway_dataframe(db, gateway_id: str,
     df['node_id'] = df['node_id'].astype(str)
 
     node_ids = sorted(df['node_id'].unique())
-    bucket_secs = _optimal_bucket_seconds(df, node_ids)
-    logger.info('Gateway %s: using %d s buckets (nodes=%s)', gateway_id, bucket_secs, node_ids)
+
+    # Check if NOAA is opted-in for this gateway
+    noaa_doc = db.NOAASettings.find_one({'gateway_id': gateway_id, 'enabled': True})
+    noaa_enabled = noaa_doc is not None
+
+    # Bucket size is driven by real sensor nodes only (NOAA is hourly, not a sensor)
+    real_node_ids = [n for n in node_ids if n != _NOAA_NODE_ID]
+    bucket_secs = _optimal_bucket_seconds(df, real_node_ids)
+    logger.info('Gateway %s: using %d s buckets (nodes=%s)', gateway_id, bucket_secs, real_node_ids)
 
     df['bucket'] = (df['time'] // bucket_secs).astype(int) * bucket_secs
     df['col'] = df['node_id'] + '_' + df['type']
@@ -158,15 +213,25 @@ def get_gateway_dataframe(db, gateway_id: str,
     )
     pivoted.columns.name = None
 
-    # Require F and H for every node that contributed data in this window
-    required = [f'{n}_{t}' for n in node_ids for t in ('F', 'H')
+    # Require F and H only from real sensor nodes; NOAA is treated as sparse
+    required = [f'{n}_{t}' for n in real_node_ids for t in ('F', 'H')
                 if f'{n}_{t}' in pivoted.columns]
     if not required:
         logger.info('No usable F/H columns for gateway %s', gateway_id)
         return None
 
+    # Handle NOAA column: forward-fill when enabled (hourly data → sub-hourly gaps),
+    # drop when NOAA is not opted-in so it doesn't pollute the feature space
+    noaa_col = f'{_NOAA_NODE_ID}_F'
+    if noaa_enabled and noaa_col in pivoted.columns:
+        pivoted[noaa_col] = pivoted[noaa_col].ffill().bfill()
+        logger.info('Gateway %s: NOAA enabled — %s included as feature', gateway_id, noaa_col)
+    elif noaa_col in pivoted.columns:
+        pivoted = pivoted.drop(columns=[noaa_col])
+
     result = pivoted.dropna(subset=required).reset_index(drop=False)
     result = result.rename(columns={'bucket': 'time_rounded'})
+    result = _add_engineered_features(result)
 
     if len(result) < 20:
         logger.info('Gateway %s: only %d aligned rows after dropna', gateway_id, len(result))
@@ -185,16 +250,43 @@ def get_gateway_dataframe(db, gateway_id: str,
 def train_and_select_best(
     node_df: pd.DataFrame,
     random_state: int = 42,
-) -> Tuple[object, str, float, List[str]]:
-    """Train IF / OC-SVM / NS-RF via madi wrappers, pick best by AUC.
+) -> Tuple[object, str, float, float, List[str]]:
+    """Train IF / OC-SVM / NS-RF via madi wrappers, pick best by F1 score.
 
-    Returns (best_detector, model_type_name, auc, feature_columns).
+    F1 is computed on the anomaly class (pos_label=0): it measures how well the
+    model identifies the synthetic anomalies in the held-out test set.  AUC is
+    also computed and retained for reference.
+
+    Returns (best_detector, model_type_name, auc, f1, feature_columns).
     feature_columns is derived from the input DataFrame columns — for gateway-level
     training these are prefixed (e.g. '1_F', '1_H', '2_F'). Normalization is embedded
     in each detector's _normalization_info attribute and persisted automatically by
     joblib when save_model() is called.
     """
     np.random.seed(random_state)
+
+    # Drop all-NaN columns (e.g. noaa_forecast_F when NOAA has no coverage at all).
+    all_nan_cols = node_df.columns[node_df.isna().all()].tolist()
+    if all_nan_cols:
+        logger.info('Dropping %d all-NaN column(s) before training: %s',
+                    len(all_nan_cols), all_nan_cols)
+        node_df = node_df.drop(columns=all_nan_cols)
+
+    # Fill any remaining NaN values with the column median (safety net for partial
+    # coverage, e.g. noaa_forecast_F rows before the first NOAA observation).
+    if node_df.isna().any().any():
+        node_df = node_df.fillna(node_df.median())
+
+    # Drop zero-variance columns before training.  Constant features carry no
+    # information and cause the NS-RandomForest negative sampler to fail:
+    # normalization divides by std=0 → NaN bounds → "Range exceeds valid bounds".
+    # This most commonly affects _roll_std and _delta columns for flat sensors.
+    variances = node_df.var()
+    zero_var_cols = variances[variances == 0].index.tolist()
+    if zero_var_cols:
+        logger.info('Dropping %d zero-variance column(s) before training: %s',
+                    len(zero_var_cols), zero_var_cols)
+        node_df = node_df.drop(columns=zero_var_cols)
 
     feature_cols = node_df.columns.tolist()
 
@@ -226,19 +318,24 @@ def train_and_select_best(
             logger.debug('Training %s...', name)
             det.train_model(x_train)
             pred_df = det.predict(X_test_df.copy())
-            auc = float(compute_auc(y_test, pred_df['class_prob'].values))
-            results[name] = (det, auc)
-            logger.info('%s AUC=%.4f', name, auc)
+            probs   = pred_df['class_prob'].values
+            auc = float(compute_auc(y_test, probs))
+            # F1 on the anomaly class (label=0): threshold class_prob at 0.5
+            y_pred = (probs >= _ANOMALY_THRESHOLD).astype(int)
+            f1  = float(sk_f1_score(y_test, y_pred, pos_label=0, zero_division=0))
+            results[name] = (det, auc, f1)
+            logger.info('%s AUC=%.4f  F1=%.4f', name, auc, f1)
         except Exception as exc:
             logger.warning('%s failed: %s', name, exc)
 
     if not results:
         raise RuntimeError('All detectors failed to train')
 
-    best_name = max(results, key=lambda k: results[k][1])
-    best_det, best_auc = results[best_name]
-    logger.info('Best model: %s (AUC=%.4f) features=%s', best_name, best_auc, feature_cols)
-    return best_det, best_name, best_auc, feature_cols
+    best_name = max(results, key=lambda k: results[k][2])   # select by F1
+    best_det, best_auc, best_f1 = results[best_name]
+    logger.info('Best model: %s (F1=%.4f  AUC=%.4f) features=%s',
+                best_name, best_f1, best_auc, feature_cols)
+    return best_det, best_name, best_auc, best_f1, feature_cols
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +347,7 @@ def _model_dir(gateway_id: str, models_dir: str = MODELS_DIR) -> str:
 
 
 def save_model(gateway_id: str, model, model_type: str,
-               auc: float, feature_columns: List[str], nodes: List[str],
+               auc: float, f1: float, feature_columns: List[str], nodes: List[str],
                num_rows: int,
                models_dir: str = MODELS_DIR) -> None:
     """Persist gateway-level model + metadata to models/{gateway}/.
@@ -276,7 +373,7 @@ def save_model(gateway_id: str, model, model_type: str,
 
     try:
         with open(meta_path, 'w') as f:
-            json.dump({'model_type': model_type, 'auc': auc,
+            json.dump({'model_type': model_type, 'auc': auc, 'f1': f1,
                        'feature_columns': feature_columns,
                        'nodes': nodes,
                        'num_rows': num_rows,
@@ -287,8 +384,8 @@ def save_model(gateway_id: str, model, model_type: str,
             os.remove(model_path)
         raise
 
-    logger.info('Saved %s gateway model (AUC=%.4f) nodes=%s num_rows=%d to %s',
-                model_type, auc, nodes, num_rows, path)
+    logger.info('Saved %s gateway model (F1=%.4f  AUC=%.4f) nodes=%s num_rows=%d to %s',
+                model_type, f1, auc, nodes, num_rows, path)
 
 
 def load_model(gateway_id: str, models_dir: str = MODELS_DIR) -> Tuple[object, Dict]:
@@ -354,6 +451,150 @@ def predict_anomalies(model, fh_df: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# NOAA historical backfill (inlined from NOAAHistoricalFetcher.py logic)
+# ---------------------------------------------------------------------------
+
+_NOAA_API_BASE  = 'https://api.weather.gov'
+_NOAA_UA        = '(SensorIoT, keyvanazami@gmail.com)'
+_NOAA_SLEEP     = 0.5   # seconds between NOAA API calls (per ToS)
+_NOAA_PAGE_LIMIT = 500
+
+
+def _backfill_noaa_history(db, gateway_id: str, lat: float, lon: float,
+                            lookback_days: int) -> None:
+    """Fetch historical NOAA observations and insert any missing hour-buckets.
+
+    Called at the start of train_for_gateway() when NOAA is enabled so that
+    the training window is fully populated before get_gateway_dataframe() runs.
+    Uses the same document schema and deduplication logic as NOAAHistoricalFetcher.py.
+    Failures are logged and swallowed — training proceeds without NOAA features
+    if the API is unavailable.
+    """
+    now_utc  = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = (now_utc - datetime.timedelta(days=lookback_days)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    end_dt   = (now_utc - datetime.timedelta(days=1)).replace(
+        hour=23, minute=59, second=59, microsecond=0)
+
+    logger.info('Gateway %s: backfilling NOAA history %s → %s',
+                gateway_id, start_dt.date(), end_dt.date())
+
+    # --- Resolve nearest observation station ---
+    try:
+        r = requests.get(
+            f'{_NOAA_API_BASE}/points/{lat:.4f},{lon:.4f}',
+            headers={'User-Agent': _NOAA_UA}, timeout=15)
+        r.raise_for_status()
+        time.sleep(_NOAA_SLEEP)
+        stations_url = r.json().get('properties', {}).get('observationStations')
+    except Exception as exc:
+        logger.warning('Gateway %s: NOAA points API failed: %s', gateway_id, exc)
+        return
+
+    if not stations_url:
+        logger.warning('Gateway %s: no observationStations in NOAA response', gateway_id)
+        return
+
+    try:
+        r2 = requests.get(stations_url, params={'limit': 5},
+                          headers={'User-Agent': _NOAA_UA}, timeout=15)
+        r2.raise_for_status()
+        time.sleep(_NOAA_SLEEP)
+        station_features = r2.json().get('features', [])
+    except Exception as exc:
+        logger.warning('Gateway %s: NOAA stations list failed: %s', gateway_id, exc)
+        return
+
+    if not station_features:
+        logger.warning('Gateway %s: no observation stations near (%.4f, %.4f)',
+                       gateway_id, lat, lon)
+        return
+
+    station_id = station_features[0]['properties']['stationIdentifier']
+    logger.info('Gateway %s: NOAA station resolved to %s', gateway_id, station_id)
+
+    # --- Load existing hour-bucket timestamps for deduplication ---
+    start_ts = start_dt.timestamp()
+    end_ts   = end_dt.timestamp()
+    existing = {
+        int(doc['time'] // 3600) * 3600
+        for doc in db.Sensors.find(
+            {'gateway_id': gateway_id, 'node_id': _NOAA_NODE_ID,
+             'type': 'F', 'time': {'$gte': start_ts, '$lte': end_ts}},
+            {'time': 1, '_id': 0},
+        )
+    }
+    logger.info('Gateway %s: %d existing NOAA hour-buckets in range', gateway_id, len(existing))
+
+    # --- Fetch observations in weekly chunks ---
+    docs: list = []
+    chunk_start = start_dt
+    chunk_delta = datetime.timedelta(days=7)
+
+    while chunk_start < end_dt:
+        chunk_end = min(chunk_start + chunk_delta, end_dt)
+        start_iso = chunk_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_iso   = chunk_end.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        next_url: str | None = None
+        pages = 0
+        while True:
+            try:
+                if next_url:
+                    obs_r = requests.get(next_url,
+                                         headers={'User-Agent': _NOAA_UA}, timeout=20)
+                else:
+                    obs_r = requests.get(
+                        f'{_NOAA_API_BASE}/stations/{station_id}/observations',
+                        params={'start': start_iso, 'end': end_iso,
+                                'limit': _NOAA_PAGE_LIMIT},
+                        headers={'User-Agent': _NOAA_UA}, timeout=20)
+                obs_r.raise_for_status()
+                time.sleep(_NOAA_SLEEP)
+                data = obs_r.json()
+            except Exception as exc:
+                logger.warning('Gateway %s: observation fetch error: %s', gateway_id, exc)
+                break
+
+            pages += 1
+            for feat in data.get('features', []):
+                try:
+                    ts_str   = feat['properties']['timestamp']
+                    obs_ts   = datetime.datetime.fromisoformat(ts_str).timestamp()
+                    temp_obj = feat['properties']['temperature']
+                    if temp_obj is None or temp_obj.get('value') is None:
+                        continue
+                    temp_f     = round(float(temp_obj['value']) * 9 / 5 + 32, 1)
+                    rounded_ts = round(obs_ts / 3600) * 3600
+                    if rounded_ts in existing:
+                        continue
+                    docs.append({
+                        'model': 'NOAA', 'gateway_id': gateway_id,
+                        'node_id': _NOAA_NODE_ID, 'type': 'F',
+                        'value': str(temp_f), 'time': float(rounded_ts),
+                    })
+                    existing.add(rounded_ts)
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+            next_url = data.get('@odata.nextLink')
+            if not next_url or not data.get('features') or pages >= 20:
+                break
+
+        chunk_start = chunk_end
+
+    # --- Insert ---
+    if docs:
+        try:
+            db.Sensors.insert_many(docs, ordered=False)
+            logger.info('Gateway %s: inserted %d NOAA history records', gateway_id, len(docs))
+        except Exception as exc:
+            logger.warning('Gateway %s: NOAA history insert error: %s', gateway_id, exc)
+    else:
+        logger.info('Gateway %s: NOAA history already up to date (0 new records)', gateway_id)
+
+
+# ---------------------------------------------------------------------------
 # Gateway-level orchestration (called from server.py background thread)
 # ---------------------------------------------------------------------------
 
@@ -365,6 +606,14 @@ def train_for_gateway(gateway_id: str, db,
     columns prefixed by node_id (e.g. '1_F', '1_H', '2_F'). One model is trained
     per gateway and saved to models/{gateway_id}/.
     """
+    # If NOAA is enabled for this gateway, backfill historical observations
+    # before building the training DataFrame so noaa_forecast_F is populated.
+    noaa_doc = db.NOAASettings.find_one({'gateway_id': gateway_id, 'enabled': True})
+    if noaa_doc and noaa_doc.get('lat') is not None and noaa_doc.get('lon') is not None:
+        _backfill_noaa_history(db, gateway_id,
+                               float(noaa_doc['lat']), float(noaa_doc['lon']),
+                               _LOOKBACK_DAYS)
+
     logger.info('Building gateway-wide DataFrame for %s', gateway_id)
     gw_df = get_gateway_dataframe(db, gateway_id)
     if gw_df is None:
@@ -374,16 +623,16 @@ def train_for_gateway(gateway_id: str, db,
 
     feature_df = gw_df.drop(columns=['time_rounded'])
     try:
-        model, model_type, auc, feature_cols = train_and_select_best(feature_df)
+        model, model_type, auc, f1, feature_cols = train_and_select_best(feature_df)
     except Exception as exc:
         logger.error('Training failed for gateway %s: %s', gateway_id, exc)
         return [{'gateway_id': gateway_id, 'status': 'failed', 'error': str(exc)}]
 
     nodes = sorted({c.rsplit('_', 1)[0] for c in feature_cols})
     num_rows = len(feature_df)
-    save_model(gateway_id, model, model_type, auc, feature_cols, nodes, num_rows, models_dir)
-    logger.info('Training complete for gateway %s: %s AUC=%.4f nodes=%s num_rows=%d',
-                gateway_id, model_type, auc, nodes, num_rows)
+    save_model(gateway_id, model, model_type, auc, f1, feature_cols, nodes, num_rows, models_dir)
+    logger.info('Training complete for gateway %s: %s F1=%.4f AUC=%.4f nodes=%s num_rows=%d',
+                gateway_id, model_type, f1, auc, nodes, num_rows)
     return [{'gateway_id': gateway_id, 'status': 'done',
-             'model_type': model_type, 'auc': round(auc, 4),
+             'model_type': model_type, 'auc': round(auc, 4), 'f1': round(f1, 4),
              'feature_columns': feature_cols, 'nodes': nodes, 'num_rows': num_rows}]

@@ -47,10 +47,13 @@ def _verify_google_token(token):
     """Verify a Google ID token and return the email, or None if invalid."""
     try:
         audience = os.getenv('GOOGLE_WEB_CLIENT_ID')
+        print(f'[Auth] Verifying token (len={len(token)}, audience={audience!r})')
         idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), audience)
-        return idinfo.get('email')
+        email = idinfo.get('email')
+        print(f'[Auth] Token OK — email={email}, iss={idinfo.get("iss")}, exp={idinfo.get("exp")}')
+        return email
     except Exception as e:
-        print(f'Token verification failed: {e}')
+        print(f'[Auth] Token verification FAILED: {e}')
         return None
 
 
@@ -59,7 +62,9 @@ def require_google_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization', '')
+        print(f'[Auth] {request.method} {request.path} — Authorization header present: {bool(auth_header)}')
         if not auth_header.startswith('Bearer '):
+            print(f'[Auth] Missing/malformed Authorization header: {auth_header!r}')
             return json.dumps({'error': 'missing token'}), 401
         token = auth_header[len('Bearer '):]
         email = _verify_google_token(token)
@@ -532,6 +537,9 @@ def save_noaa_settings():
             'gateway_id': data.get('gateway_id'),
             'outside_sensor_id': data.get('outside_sensor_id'),
             'enabled': data.get('enabled', True),
+            'predictive_alerts_enabled': data.get('predictive_alerts_enabled', False),
+            'frost_threshold': data.get('frost_threshold', 35.0),
+            'heat_threshold': data.get('heat_threshold', 95.0),
         }},
         upsert=True,
     )
@@ -640,6 +648,235 @@ def anomaly_model_status():
 
     with open(meta_path) as f:
         return json.dumps(json.load(f))
+
+
+# ---------------------------------------------------------------------------
+# Alert Rules & Device Tokens
+# ---------------------------------------------------------------------------
+
+@app.route('/alert_rules', methods=['GET'])
+@require_google_auth
+def get_alert_rules():
+    rules = list(db.AlertRules.find({'email': g.user_email}, {'_id': 0}))
+    print(f'[AlertRules] GET — email={g.user_email}, found {len(rules)} rule(s)')
+    return json.dumps(rules)
+
+
+@app.route('/alert_rules', methods=['POST'])
+@require_google_auth
+def create_alert_rule():
+    body = request.get_json(silent=True) or {}
+    print(f'[AlertRules] POST — email={g.user_email}, body_keys={list(body.keys())}, '
+          f'gateway_id={body.get("gateway_id")!r}, node_id={body.get("node_id")!r}, '
+          f'type={body.get("type")!r}, operator={body.get("operator")!r}')
+    body['email'] = g.user_email
+    body['rule_id'] = str(uuid.uuid4())
+    body.setdefault('enabled', True)
+    body.setdefault('cooldown_minutes', 60)
+    body.setdefault('push_enabled', True)
+    body.pop('_id', None)
+    db.AlertRules.insert_one(body)
+    body.pop('_id', None)
+    print(f'[AlertRules] POST — inserted rule_id={body.get("rule_id")}, label={body.get("label")!r}')
+    return json.dumps(body), 201
+
+
+@app.route('/alert_rules/<rule_id>', methods=['PUT'])
+@require_google_auth
+def update_alert_rule(rule_id):
+    body = request.get_json(silent=True) or {}
+    body.pop('_id', None)
+    body.pop('rule_id', None)
+    body.pop('email', None)
+    result = db.AlertRules.update_one(
+        {'rule_id': rule_id, 'email': g.user_email},
+        {'$set': body},
+    )
+    if result.matched_count == 0:
+        return json.dumps({'error': 'not found or not yours'}), 404
+    return json.dumps({'updated': True})
+
+
+@app.route('/alert_rules/<rule_id>', methods=['DELETE'])
+@require_google_auth
+def delete_alert_rule(rule_id):
+    result = db.AlertRules.delete_one(
+        {'rule_id': rule_id, 'email': g.user_email}
+    )
+    if result.deleted_count == 0:
+        return json.dumps({'error': 'not found or not yours'}), 404
+    return json.dumps({'deleted': True})
+
+
+@app.route('/device_token', methods=['POST'])
+@require_google_auth
+def register_device_token():
+    body = request.get_json(silent=True) or {}
+    token    = body.get('token', '')
+    platform = body.get('platform', 'ios')
+    if not token:
+        return json.dumps({'error': 'token required'}), 400
+    db.DeviceTokens.update_one(
+        {'email': g.user_email, 'platform': platform},
+        {'$set': {'token': token, 'updated_at': int(dt.datetime.utcnow().timestamp())}},
+        upsert=True,
+    )
+    return json.dumps({'registered': True})
+
+
+# ---------------------------------------------------------------------------
+# Baseline Learning
+# ---------------------------------------------------------------------------
+
+@app.route('/compute_baseline', methods=['POST'])
+def compute_baseline():
+    body = request.get_json(silent=True) or {}
+    gateway_id = body.get('gateway_id', '')
+    node_id    = body.get('node_id', '')
+    sensor_type = body.get('type', 'F')
+    days       = int(body.get('days', 30))
+
+    if not gateway_id or not node_id:
+        return json.dumps({'error': 'gateway_id and node_id required'}), 400
+
+    cutoff_unix = int(dt.datetime.utcnow().timestamp()) - days * 86400
+
+    # Some older records have value stored as b'39.61' (Python bytes repr).
+    # $trim strips the b and ' characters from both ends before conversion;
+    # $convert onError:null silently skips any remaining unparseable values.
+    _safe_val = {'$convert': {
+        'input': {'$trim': {'input': '$value', 'chars': "b'"}},
+        'to': 'double', 'onError': None,
+    }}
+
+    pipeline = [
+        {'$match': {
+            'gateway_id': gateway_id,
+            'node_id':    node_id,
+            'type':       sensor_type,
+            'time':       {'$gte': cutoff_unix},
+        }},
+        {'$group': {
+            '_id': {
+                'hour':        {'$hour': {'$toDate': {'$multiply': [{'$toDouble': '$time'}, 1000]}}},
+                'day_of_week': {'$dayOfWeek': {'$toDate': {'$multiply': [{'$toDouble': '$time'}, 1000]}}},
+            },
+            'mean':  {'$avg': _safe_val},
+            'std':   {'$stdDevSamp': _safe_val},
+            'count': {'$sum': 1},
+        }},
+    ]
+
+    cursor = sensors.aggregate(pipeline)
+    computed_at = int(dt.datetime.utcnow().timestamp())
+    bucket_count = 0
+
+    for doc in cursor:
+        hour = doc['_id']['hour']
+        dow  = doc['_id']['day_of_week']
+        db.Baselines.update_one(
+            {'gateway_id': gateway_id, 'node_id': node_id, 'type': sensor_type,
+             'hour': hour, 'day_of_week': dow},
+            {'$set': {
+                'mean': doc['mean'],
+                'std':  doc['std'] or 0.0,
+                'count': doc['count'],
+                'computed_at': computed_at,
+            }},
+            upsert=True,
+        )
+        bucket_count += 1
+
+    return json.dumps({'bucket_count': bucket_count, 'computed_at': computed_at})
+
+
+@app.route('/baseline/<gw>', methods=['GET'])
+def get_baseline(gw):
+    node = request.args.get('node', '')
+    sensor_type = request.args.get('type', 'F')
+    if not node:
+        return json.dumps({'error': 'node parameter required'}), 400
+
+    cursor = db.Baselines.find(
+        {'gateway_id': gw, 'node_id': node, 'type': sensor_type},
+        {'_id': 0, 'gateway_id': 0, 'node_id': 0, 'type': 0},
+    )
+    return json.dumps(list(cursor))
+
+
+@app.route('/baseline_status/<gw>', methods=['GET'])
+def baseline_status(gw):
+    node = request.args.get('node', '')
+    sensor_type = request.args.get('type', 'F')
+    if not node:
+        return json.dumps({'error': 'node parameter required'}), 400
+
+    doc = db.Baselines.find_one(
+        {'gateway_id': gw, 'node_id': node, 'type': sensor_type},
+        {'computed_at': 1, '_id': 0},
+    )
+    if not doc:
+        return json.dumps({})
+
+    count = db.Baselines.count_documents(
+        {'gateway_id': gw, 'node_id': node, 'type': sensor_type}
+    )
+    return json.dumps({'computed_at': doc['computed_at'], 'bucket_count': count})
+
+
+# ---------------------------------------------------------------------------
+# Heatmap / Calendar View
+# ---------------------------------------------------------------------------
+
+@app.route('/heatmap/<gw>', methods=['GET'])
+def heatmap(gw):
+    node = request.args.get('node', '')
+    sensor_type = request.args.get('type', 'F')
+    try:
+        year = int(request.args.get('year', dt.datetime.utcnow().year))
+    except ValueError:
+        return json.dumps({'error': 'year must be an integer'}), 400
+
+    if not node:
+        return json.dumps({'error': 'node parameter required'}), 400
+
+    year_start = dt.datetime(year, 1, 1, tzinfo=dt.timezone.utc)
+    year_end   = dt.datetime(year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    year_start_unix = int(year_start.timestamp())
+    year_end_unix   = int(year_end.timestamp())
+
+    _safe_val = {'$convert': {
+        'input': {'$trim': {'input': '$value', 'chars': "b'"}},
+        'to': 'double', 'onError': None,
+    }}
+
+    pipeline = [
+        {'$match': {
+            'gateway_id': gw,
+            'node_id':    node,
+            'type':       sensor_type,
+            'time':       {'$gte': year_start_unix, '$lt': year_end_unix},
+        }},
+        {'$group': {
+            '_id': {'$dateToString': {
+                'format': '%Y-%m-%d',
+                'date': {'$toDate': {'$multiply': [{'$toDouble': '$time'}, 1000]}},
+            }},
+            'min':   {'$min': _safe_val},
+            'max':   {'$max': _safe_val},
+            'avg':   {'$avg': _safe_val},
+            'count': {'$sum': 1},
+        }},
+        {'$sort': {'_id': 1}},
+    ]
+
+    cursor = sensors.aggregate(pipeline)
+    results = [
+        {'date': doc['_id'], 'min': doc['min'], 'max': doc['max'],
+         'avg': doc['avg'], 'count': doc['count']}
+        for doc in cursor
+    ]
+    return json.dumps(results)
 
 
 # ---------------------------------------------------------------------------

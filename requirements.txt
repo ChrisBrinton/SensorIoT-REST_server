@@ -8,7 +8,7 @@ gunicorn
 certbot
 certbot-nginx
 sense-energy
-dotenv
+python-dotenv
 requests
 google-auth
 google-auth-oauthlib
