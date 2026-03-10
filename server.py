@@ -20,6 +20,7 @@ import base64
 load_dotenv()
 
 import anomaly_training as _at
+import regression_training as _rt
 
 # ---------------------------------------------------------------------------
 # Database
@@ -540,9 +541,38 @@ def save_noaa_settings():
             'predictive_alerts_enabled': data.get('predictive_alerts_enabled', False),
             'frost_threshold': data.get('frost_threshold', 35.0),
             'heat_threshold': data.get('heat_threshold', 95.0),
+            'baseline_forecast_alert_enabled': data.get('baseline_forecast_alert_enabled', False),
+            'baseline_actual_alert_enabled': data.get('baseline_actual_alert_enabled', False),
         }},
         upsert=True,
     )
+    return 'OK'
+
+
+# ---------------------------------------------------------------------------
+# Analytics Settings (anomaly detection, baseline, regression model toggles)
+# ---------------------------------------------------------------------------
+
+@app.route('/analytics_settings', methods=['GET'])
+@require_google_auth
+def get_analytics_settings():
+    """Return the analytics settings for the authenticated user."""
+    doc = db.AnalyticsSettings.find_one({'email': g.user_email}, {'_id': 0, 'email': 0})
+    return json.dumps(doc or {})
+
+
+@app.route('/analytics_settings', methods=['POST'])
+@require_google_auth
+def save_analytics_settings():
+    """Create or update analytics settings for the authenticated user."""
+    data = request.get_json(force=True) or {}
+    allowed = {'anomaly_detection_enabled', 'anomaly_threshold',
+                'baseline_enabled', 'regression_model_enabled'}
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if updates:
+        updates['email'] = g.user_email
+        db.AnalyticsSettings.update_one(
+            {'email': g.user_email}, {'$set': updates}, upsert=True)
     return 'OK'
 
 
@@ -648,6 +678,82 @@ def anomaly_model_status():
 
     with open(meta_path) as f:
         return json.dumps(json.load(f))
+
+
+# ---------------------------------------------------------------------------
+# Regression Forecasting
+# ---------------------------------------------------------------------------
+
+_regression_jobs: dict = {}
+
+
+def _run_regression_training(job_id: str, gateway_ids: list) -> None:
+    """Background thread: train regression models for all gateways."""
+    all_results = []
+    try:
+        for gw_id in gateway_ids:
+            results = _rt.train_regression_for_gateway(gw_id, db)
+            all_results.extend(results)
+        _regression_jobs[job_id] = {'status': 'done', 'results': all_results}
+        print(f'[regression] Job {job_id} done: {len(all_results)} sensor(s) processed')
+    except Exception as exc:
+        _regression_jobs[job_id] = {'status': 'failed', 'error': str(exc)}
+        print(f'[regression] Job {job_id} failed: {exc}')
+
+
+@app.route('/train_regression_model', methods=['POST'])
+def train_regression_model():
+    data = request.get_json() or {}
+    gateway_ids = data.get('gateway_ids', [])
+    if not gateway_ids:
+        return json.dumps({'error': 'gateway_ids required'}), 400
+
+    job_id = str(uuid.uuid4())
+    _regression_jobs[job_id] = {'status': 'running', 'started_at': time.time()}
+
+    t = threading.Thread(target=_run_regression_training,
+                         args=(job_id, gateway_ids), daemon=True)
+    t.start()
+    return json.dumps({'job_id': job_id, 'status': 'started'})
+
+
+@app.route('/regression_training_status', methods=['GET'])
+def regression_training_status():
+    job_id = request.args.get('job_id', '')
+    job = _regression_jobs.get(job_id)
+    if job is None:
+        return json.dumps({'error': 'unknown job_id'}), 404
+    return json.dumps({'job_id': job_id, **job})
+
+
+@app.route('/regression_model_status', methods=['GET'])
+def regression_model_status():
+    gateway_id = request.args.get('gateway_id', '')
+    if not gateway_id:
+        return json.dumps({'error': 'gateway_id required'}), 400
+    metas = _rt.load_all_regression_metadata(gateway_id)
+    return json.dumps({'models': metas})
+
+
+@app.route('/regression_forecast', methods=['GET'])
+def regression_forecast():
+    gateway_id  = request.args.get('gateway_id', '')
+    node_id     = request.args.get('node_id', '')
+    sensor_type = request.args.get('type', 'F')
+    try:
+        hours = int(request.args.get('hours', '48'))
+    except (ValueError, TypeError):
+        hours = 48
+
+    if not gateway_id or not node_id:
+        return json.dumps({'error': 'gateway_id and node_id required'}), 400
+
+    if not _rt.regression_model_exists(gateway_id, node_id, sensor_type):
+        return json.dumps({'error': 'no regression model trained for this sensor'}), 404
+
+    forecast = _rt.predict_sensor_forecast(
+        gateway_id, node_id, sensor_type, db, hours=hours)
+    return json.dumps({'forecast': forecast})
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +915,15 @@ def baseline_status(gw):
     node = request.args.get('node', '')
     sensor_type = request.args.get('type', 'F')
     if not node:
-        return json.dumps({'error': 'node parameter required'}), 400
+        # Gateway-level check: does any baseline exist for this gateway?
+        doc = db.Baselines.find_one(
+            {'gateway_id': gw},
+            {'computed_at': 1, '_id': 0},
+            sort=[('computed_at', -1)],
+        )
+        if not doc:
+            return json.dumps({'exists': False})
+        return json.dumps({'exists': True, 'computed_at': doc.get('computed_at')})
 
     doc = db.Baselines.find_one(
         {'gateway_id': gw, 'node_id': node, 'type': sensor_type},
