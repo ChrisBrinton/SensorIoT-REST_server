@@ -1,4 +1,12 @@
-# SensorIoT — REST API Server
+# [DEPRECATED] SensorIoT — REST API Server
+
+> **This repository is deprecated.** All code has been consolidated into
+> [SensorIoT-Broker/appbackend](https://github.com/cbrinton/SensorIoT-Broker).
+> Future development should happen there. This repo is kept for historical reference only.
+
+---
+
+# SensorIoT — REST API Server (archived)
 
 Flask REST API serving IoT sensor data from MongoDB. Includes Google Home OAuth/fulfillment, ML anomaly detection, regression forecasting, and database maintenance tools.
 
